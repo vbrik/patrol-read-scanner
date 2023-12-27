@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 import argparse
-import sys
-from time import sleep
-from pathlib import Path
-from itertools import chain
-import multiprocessing as mp
-from syslog import syslog
 import json
-
+import multiprocessing as mp
+import os
+import sys
+from itertools import chain
+from pathlib import Path
+from syslog import syslog
+from time import sleep
 
 def worker(path, read_size, delay):
     dev = open(path, 'rb')
+    # Seek to the middle of the disk. The rationale is that, since rotational
+    # disks tend to get filled up starting from the beginning, there is a decent
+    # chance that data will be read at some point, and, therefore, bad sectors
+    # in the beginning of the disk are more likely to be discovered "naturally".
+    # The tail end of a disk is less likely to contain application data, and bad
+    # sectors there are less likely to be discovered. This situation is made worse
+    # by the fact that this script is likely to be reading data at a VERY slow pace,
+    # and restarts and reboots may interrupt the progress before the tail regions
+    # of disks are scanned.
+    size = dev.seek(0, os.SEEK_END)
+    # ensure disks are aligned
+    dev.seek((int(size / 2) // read_size) * read_size)
     while True:
         position = dev.tell()
         try:
