@@ -1,19 +1,38 @@
 #!/usr/bin/env python3
 import argparse
+import errno
 import json
 import multiprocessing as mp
 import os
 import sys
-import errno
 from pathlib import Path
 from syslog import syslog
 from time import sleep, perf_counter
 
 
-def scan_device(path, read_size, delay, slow_read_threshold, problem_backoff, start_from_middle=False):
-    syslog(f"patrol-read-scanner: starting new scan path={path} read_size={read_size} delay={delay} "
-           f"slow_read_threshold={slow_read_threshold} problem_backoff={problem_backoff} "
-           f"start_from_middle={start_from_middle}")
+# This script's syslog output is meant to be watched by a logwatch.
+# I separated log functions like this to make it easier to keep the message
+# structure in-sync with logwatch rules and to make accidental logwatch
+# breakage less likely. If the prefix strings used by log_*() are changed,
+# make sure logwatch rules are updated as well.
+def log_info(msg: str): syslog(f"patrol-read-scanner INFO: {msg}")
+def log_warning(msg: str): syslog(f"patrol-read-scanner WARNING: {msg}")
+def log_error(msg: str): syslog(f"patrol-read-scanner ERROR: {msg}")
+
+
+def scan_device_wrapper(*args, **kwargs):
+    try:
+        return scan_device(*args, **kwargs)
+    except Exception as e:  # noqa
+        log_error("Exception in child {e}")
+        raise
+
+
+def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: float, problem_backoff: float,
+                start_from_middle: bool = False):
+    log_info(f"starting new scan path={path} read_size={read_size} delay={delay} "
+             f"slow_read_threshold={slow_read_threshold} problem_backoff={problem_backoff} "
+             f"start_from_middle={start_from_middle}")
     dev = open(path, "rb", buffering=0)
     if start_from_middle:
         size = dev.seek(0, os.SEEK_END)
@@ -27,7 +46,7 @@ def scan_device(path, read_size, delay, slow_read_threshold, problem_backoff, st
             latency = perf_counter() - start_time
         except OSError as e:
             if e.errno == errno.EIO:
-                syslog(f"patrol-read-scanner ERROR: I/O error dev={dev.name} start_pos={start_pos}, read_size={read_size}")
+                log_error(f"I/O error dev={dev.name} start_pos={start_pos}, read_size={read_size}")
                 # move forward but stay aligned
                 dev.seek(start_pos + read_size)
                 sleep(problem_backoff)
@@ -35,19 +54,25 @@ def scan_device(path, read_size, delay, slow_read_threshold, problem_backoff, st
                 raise
         else:
             if latency > slow_read_threshold:
-                syslog(f"patrol-read-scanner WARNING: slow I/O dev={dev.name}, latency={latency}s, start_pos={start_pos}, "
-                       f"read_size={read_size}")
+                log_warning(f"slow I/O dev={dev.name}, latency={latency}s, start_pos={start_pos}, "
+                            f"read_size={read_size}")
                 sleep(problem_backoff)
             if len(bytes_read) == 0:
-                syslog(f"patrol-read-scanner: completed scan dev={dev.name}")
+                log_info(f"completed scan dev={dev.name}")
                 return
         sleep(delay)
 
 
-def get_rotational_devices():
-    rotational_file_paths = Path('/sys/devices').glob('pci*/**/rotational')
-    rotational_device_names = [path.parts[-3] for path in rotational_file_paths if path.read_bytes() == b'1\n']
-    return [Path(f"/dev/{dev_name}") for dev_name in rotational_device_names]
+def get_hdd_devices():
+    """Return list of /dev device paths of hard disk drives"""
+    rotational_file_paths = list(Path('/sys/devices').glob('pci*/**/queue/rotational'))
+    rotational_device_names = set(path.parts[-3] for path in rotational_file_paths if path.read_bytes() == b'1\n')
+    # SD card readers, USB sticks, and virtual media (e.g. iDRAC) are considered
+    # to be rotational for some reason. Filter them out by looking at the "removable"
+    # file. This will also take care of CD drives.
+    removable_file_paths = [path.parents[1] / 'removable' for path in rotational_file_paths]
+    removable_device_names = set(path.parts[-2] for path in removable_file_paths if path.read_bytes() == b'1\n')
+    return [Path(f"/dev/{dev_name}") for dev_name in rotational_device_names - removable_device_names]
 
 
 def main():
@@ -65,10 +90,11 @@ def main():
                     "to run as a daemon and communicates via syslog. It reports "
                     "read failures and abnormal read latencies.",
         epilog=("Notes: [1] If device paths are not specified as arguments or in the "
-                "config file, the script will use all rotational devices. Removal of "
-                "a device will not result in an error, and if a device is added, the"
-                "script will start scanning it. If device paths are specified, the "
-                "script will error out if a device is removed, and added devices will "
+                "config file, the script will try to discover and use all spinning disks "
+                "(no HDDs will be missed, but some SSDs may be mistaken for HDDs). Removal "
+                "of a device will not result in an error, and if a device is added, the"
+                "script will start scanning it. Otherwise, if device paths are specified, "
+                "the script will error out if a device is removed, and added devices will "
                 "be ignored. "
                 "[2] Attempts to read from a problematic area are likely to cause very "
                 "high latencies (e.g. 10 seconds) for other I/O operations, and problematic "
@@ -84,7 +110,7 @@ def main():
                 "restarts and reboots will cause tail ends of devices to be scanned less "
                 "often. "))
     parser.add_argument("devpaths", nargs="*", metavar="PATH",
-                        help="device files to read from [1] (default: all rotational devices)")
+                        help="device files to read from [1] (default: all spinning disks)")
     parser.add_argument("--delay", metavar="SECONDS", type=float,
                         help=f"delay between reads (default: {default_delay})")
     parser.add_argument("--readsize", metavar="BYTES", type=int,
@@ -94,6 +120,10 @@ def main():
     parser.add_argument("--problembackoff", metavar="SECONDS", type=float,
                         help=f"amount of time to sleep if an IO problem is encountered [2] "
                              f"(default={default_problembackoff})")
+    parser.add_argument("--main-loop-sleep", metavar="SECONDS", type=float, default=600,  # update help if changing
+                        help="amount of time to sleep between checking up on child processes."
+                             "This is intended for testing and cannot be configured from the"
+                             "config file (default: 600)")
     parser.add_argument("--conf-file", metavar="PATH",
                         help="load settings from YAML config file (command line "
                              "arguments override config file values)")
@@ -114,11 +144,13 @@ def main():
     slowthreshold = args.slowthreshold if args.slowthreshold else conf.get("slowthreshold", default_slowthreshold)
     problembackoff = args.problembackoff if args.problembackoff else conf.get("problembackoff", default_problembackoff)
 
-    syslog(f"patrol-read-scanner: main thread starting devpaths={devpaths or 'ALL_ROTATIONAL'}, delay={delay}, "
-           f"readsize={readsize}, slowthreshold={slowthreshold}, problembackoff={problembackoff}")
+    log_info(f"main thread starting devpaths={devpaths or 'ALL_ROTATIONAL'}, delay={delay}, "
+             f"readsize={readsize}, slowthreshold={slowthreshold}, problembackoff={problembackoff}")
+    if not devpaths:
+        log_info(f"initial set of discovered spinning disks: {sorted(get_hdd_devices())}")
 
-    if not devpaths and not get_rotational_devices():
-        syslog(f"patrol-read-scanner ERROR: no device paths specified and no rotational devices discovered")
+    if not devpaths and not get_hdd_devices():
+        log_error(f"no device paths specified and no spinning disks discovered")
         parser.error("Error: no device paths specified and no rotational devices discovered.")
 
     # Use fork to start children in case we are run under ionice
@@ -129,23 +161,26 @@ def main():
     while True:
         for proc in children.values():
             if proc.exitcode == 1:
-                syslog(f"patrol-read-scanner ERROR: terminating because child encountered an error")
+                log_error(f"terminating because a child encountered an error")
                 [p.kill() for p in children.values() if p.is_alive()]
                 return
-        for devpath in devpaths or get_rotational_devices():
+        for devpath in devpaths or get_hdd_devices():
             worker_args = (devpath, readsize, delay, slowthreshold, problembackoff)
             # If we have started a scan on this device before,
             # start a new scan if the old one finished.
             if devpath in children:
-                if not children[devpath].is_alive():
-                    children[devpath] = mp.Process(target=scan_device, args=worker_args)
+                if children[devpath].is_alive():
+                    continue
+                else:  # child exited; start new one
+                    children[devpath] = mp.Process(target=scan_device_wrapper, args=worker_args)
                     children[devpath].start()
             # If we haven't started any scans of this device before,
             # start new scan from the middle of the device.
             else:
-                children[devpath] = mp.Process(target=scan_device, args=worker_args, kwargs={'start_from_middle': True})
+                children[devpath] = mp.Process(target=scan_device_wrapper, args=worker_args,
+                                               kwargs={'start_from_middle': True})
                 children[devpath].start()
-        sleep(1)
+        sleep(10)
 
 
 if __name__ == "__main__":
