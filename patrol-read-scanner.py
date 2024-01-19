@@ -63,7 +63,7 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
         sleep(delay)
 
 
-def get_hdd_devices():
+def discover_hdd_devices():
     """Return list of /dev device paths of hard disk drives"""
     rotational_file_paths = list(Path('/sys/devices').glob('pci*/**/queue/rotational'))
     rotational_device_names = set(path.parts[-3] for path in rotational_file_paths if path.read_bytes() == b'1\n')
@@ -93,9 +93,9 @@ def main():
                 "config file, the script will try to discover and use all spinning disks "
                 "(no HDDs will be missed, but some SSDs may be mistaken for HDDs). Removal "
                 "of a device will not result in an error, and if a device is added, the"
-                "script will start scanning it. Otherwise, if device paths are specified, "
-                "the script will error out if a device is removed, and added devices will "
-                "be ignored. "
+                "script will start scanning it. Otherwise, if device paths are explicitly "
+                "specified, the script will error out if a device is removed, and added "
+                "devices will be ignored. "
                 "[2] Attempts to read from a problematic area are likely to cause very "
                 "high latencies (e.g. 10 seconds) for other I/O operations, and problematic "
                 "areas may be clustered together, and therefore scanned in close succession. "
@@ -147,9 +147,9 @@ def main():
     log_info(f"main thread starting devpaths={devpaths or 'ALL_ROTATIONAL'}, delay={delay}, "
              f"readsize={readsize}, slowthreshold={slowthreshold}, problembackoff={problembackoff}")
     if not devpaths:
-        log_info(f"initial set of discovered spinning disks: {sorted(get_hdd_devices())}")
+        log_info(f"initial set of discovered spinning disks: {sorted(discover_hdd_devices())}")
 
-    if not devpaths and not get_hdd_devices():
+    if not devpaths and not discover_hdd_devices():
         log_error(f"no device paths specified and no spinning disks discovered")
         parser.error("Error: no device paths specified and no rotational devices discovered.")
 
@@ -164,7 +164,9 @@ def main():
                 log_error(f"terminating because a child encountered an error")
                 [p.kill() for p in children.values() if p.is_alive()]
                 return
-        for devpath in devpaths or get_hdd_devices():
+        # There is a race here: if device is removed after discover_hdd_devices() is called
+        # but before a child thread opens it, main thread will error though it shouldn't
+        for devpath in devpaths or discover_hdd_devices():
             worker_args = (devpath, readsize, delay, slowthreshold, problembackoff)
             # If we have started a scan on this device before,
             # start a new scan if the old one finished.
@@ -174,8 +176,8 @@ def main():
                 else:  # child exited; start new one
                     children[devpath] = mp.Process(target=scan_device_wrapper, args=worker_args)
                     children[devpath].start()
-            # If we haven't started any scans of this device before,
-            # start new scan from the middle of the device.
+            # If devpath not in children, then we haven't started any scans of
+            # this device before. Start a new scan from the middle of the device.
             else:
                 children[devpath] = mp.Process(target=scan_device_wrapper, args=worker_args,
                                                kwargs={'start_from_middle': True})
