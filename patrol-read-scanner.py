@@ -92,7 +92,7 @@ def discover_hdd_devices():
 def main():
     default_delay = 0.025
     default_readsize = 1024*128
-    default_slowthreshold = 0.2
+    default_slowthreshold = 1
     default_problembackoff = 10
 
     parser = argparse.ArgumentParser(
