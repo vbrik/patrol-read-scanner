@@ -11,8 +11,8 @@ from time import sleep, perf_counter
 
 
 # This script's syslog output is meant to be watched by a logwatch.
-# I separated log functions like this to make it easier to keep the message
-# structure in-sync with logwatch rules and to make accidental logwatch
+# I separated log functions like this to make it easier to keep the structure
+# of all messages in-sync with logwatch rules and to make accidental logwatch
 # breakage less likely. If the prefix strings used by log_*() are changed,
 # make sure logwatch rules are updated as well.
 def log_info(msg: str): syslog(f"patrol-read-scanner INFO: {msg}")
@@ -24,13 +24,27 @@ def scan_device_wrapper(*args, **kwargs):
     try:
         return scan_device(*args, **kwargs)
     except Exception as e:  # noqa
-        log_error("Exception in child {e}")
+        log_error(f"Exception in child {args} {kwargs} {e}")
         raise
 
 
 def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: float, problem_backoff: float,
                 start_from_middle: bool = False):
-    log_info(f"starting new scan path={path} read_size={read_size} delay={delay} "
+    """
+    Perform a read scan of a device. Report I/O errors and slow reads. Sleep between reads.
+    Sleep after I/O errors and slow reads.
+
+    Args:
+        path (str): /dev path to the device
+        read_size (): what read size to use
+        delay (): delay between reads
+        slow_read_threshold (): at what point to consider reads "slow"
+        problem_backoff (): sleep time after a slow read or I/O error is encountered
+        start_from_middle (): begin scanning from the middle, rather than the beginning of the device
+
+    Returns: None
+    """
+    log_info(f"starting a new scan path={path} read_size={read_size} delay={delay} "
              f"slow_read_threshold={slow_read_threshold} problem_backoff={problem_backoff} "
              f"start_from_middle={start_from_middle}")
     dev = open(path, "rb", buffering=0)
@@ -120,9 +134,9 @@ def main():
     parser.add_argument("--problembackoff", metavar="SECONDS", type=float,
                         help=f"amount of time to sleep if an IO problem is encountered [2] "
                              f"(default={default_problembackoff})")
-    parser.add_argument("--main-loop-sleep", metavar="SECONDS", type=float, default=600,  # update help if changing
-                        help="amount of time to sleep between checking up on child processes."
-                             "This is intended for testing and cannot be configured from the"
+    parser.add_argument("--main-loop-sleep", metavar="SECONDS", type=float, default=600,  # keep default in sync w/ help
+                        help="amount of time to sleep between checking up on child processes. "
+                             "This is intended for testing and cannot be configured from the "
                              "config file (default: 600)")
     parser.add_argument("--conf-file", metavar="PATH",
                         help="load settings from YAML config file (command line "
@@ -133,9 +147,9 @@ def main():
     # Attempt to load config from file.
     if args.conf_file:
         with open(args.conf_file, "rb") as f:
-            jsons = f.read().strip()
-            if jsons:
-                conf = json.loads(jsons)
+            json_str = f.read().strip()
+            if json_str:
+                conf = json.loads(json_str)
 
     # Set parameters. Precedence: command line, then config file, then defaults.
     devpaths = args.devpaths if args.devpaths else conf.get("devpaths", None)  # None means use all rotational devs
@@ -144,8 +158,8 @@ def main():
     slowthreshold = args.slowthreshold if args.slowthreshold else conf.get("slowthreshold", default_slowthreshold)
     problembackoff = args.problembackoff if args.problembackoff else conf.get("problembackoff", default_problembackoff)
 
-    log_info(f"main thread starting devpaths={devpaths or 'ALL_ROTATIONAL'}, delay={delay}, "
-             f"readsize={readsize}, slowthreshold={slowthreshold}, problembackoff={problembackoff}")
+    log_info(f"main thread starting devpaths={devpaths}, delay={delay}, readsize={readsize}, "
+             f"slowthreshold={slowthreshold}, problembackoff={problembackoff}")
     if not devpaths:
         log_info(f"initial set of discovered spinning disks: {sorted(discover_hdd_devices())}")
 
@@ -159,13 +173,13 @@ def main():
 
     children = {}
     while True:
+        # exit if any child encountered a fatal error
         for proc in children.values():
             if proc.exitcode == 1:
                 log_error(f"terminating because a child encountered an error")
                 [p.kill() for p in children.values() if p.is_alive()]
                 return
-        # There is a race here: if device is removed after discover_hdd_devices() is called
-        # but before a child thread opens it, main thread will error though it shouldn't
+        # (re)start device scans
         for devpath in devpaths or discover_hdd_devices():
             worker_args = (devpath, readsize, delay, slowthreshold, problembackoff)
             # If we have started a scan on this device before,
@@ -182,7 +196,7 @@ def main():
                 children[devpath] = mp.Process(target=scan_device_wrapper, args=worker_args,
                                                kwargs={'start_from_middle': True})
                 children[devpath].start()
-        sleep(10)
+        sleep(args.main_loop_sleep)
 
 
 if __name__ == "__main__":
