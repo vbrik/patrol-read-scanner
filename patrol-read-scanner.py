@@ -69,8 +69,12 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
             dev.close()
             try:
                 dev = open(path, "rb", buffering=0)
-            except FileNotFoundError:
-                log_error(f"Device disappeared. FileNotFoundError on re-open of {dev.name}")
+            except OSError:
+                if e.errno not in (errno.EIO, errno.ENXIO):
+                    raise
+                # I/O error or "No such device or address" (which one depends
+                # on whether the kernel had time to remove the /dev file)
+                log_error(f"Device {dev.name} disappeared")
                 return
             # move forward but stay aligned
             dev.seek(start_pos + read_size)
