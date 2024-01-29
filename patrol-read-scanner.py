@@ -60,7 +60,7 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
             latency = perf_counter() - start_time
         except OSError as e:
             if e.errno != errno.EIO:
-                raise
+                raise  # unexpected exception
             # I/O error encountered
             log_error(f"I/O error dev={dev.name} start_pos={start_pos}, read_size={read_size}")
             # It's possible we got an I/O error not because of drive malfunction
@@ -71,7 +71,7 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
                 dev = open(path, "rb", buffering=0)
             except OSError:
                 if e.errno not in (errno.EIO, errno.ENXIO):
-                    raise
+                    raise  # unexpected exception
                 # I/O error or "No such device or address" (which one depends
                 # on whether the kernel had time to remove the /dev file)
                 log_error(f"Device {dev.name} disappeared")
@@ -79,6 +79,7 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
             # move forward but stay aligned
             dev.seek(start_pos + read_size)
             sleep(problem_backoff)
+        # successful read
         else:
             if latency > slow_read_threshold:
                 log_warning(f"slow I/O dev={dev.name}, latency={latency}s, start_pos={start_pos}, "
