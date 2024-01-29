@@ -36,11 +36,11 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
 
     Args:
         path (str): /dev path to the device
-        read_size (): what read size to use
-        delay (): delay between reads
-        slow_read_threshold (): at what point to consider reads "slow"
-        problem_backoff (): sleep time after a slow read or I/O error is encountered
-        start_from_middle (): begin scanning from the middle, rather than the beginning of the device
+        read_size (int): what read size to use
+        delay (float): delay between reads
+        slow_read_threshold (float): at what point to consider reads "slow"
+        problem_backoff (float): sleep time after a slow read or I/O error is encountered
+        start_from_middle (bool): begin scanning from the middle, rather than the beginning of the device
 
     Returns: None
     """
@@ -59,13 +59,22 @@ def scan_device(path: str, read_size: int, delay: float, slow_read_threshold: fl
             bytes_read = dev.read(read_size)
             latency = perf_counter() - start_time
         except OSError as e:
-            if e.errno == errno.EIO:
-                log_error(f"I/O error dev={dev.name} start_pos={start_pos}, read_size={read_size}")
-                # move forward but stay aligned
-                dev.seek(start_pos + read_size)
-                sleep(problem_backoff)
-            else:
+            if e.errno != errno.EIO:
                 raise
+            # I/O error encountered
+            log_error(f"I/O error dev={dev.name} start_pos={start_pos}, read_size={read_size}")
+            # It's possible we got an I/O error not because of drive malfunction
+            # but because it was removed from the system. To rule that out, try to
+            # reopen the device.
+            dev.close()
+            try:
+                dev = open(path, "rb", buffering=0)
+            except FileNotFoundError:
+                log_error(f"Device disappeared. FileNotFoundError on re-open of {dev.name}")
+                return
+            # move forward but stay aligned
+            dev.seek(start_pos + read_size)
+            sleep(problem_backoff)
         else:
             if latency > slow_read_threshold:
                 log_warning(f"slow I/O dev={dev.name}, latency={latency}s, start_pos={start_pos}, "
